@@ -270,6 +270,48 @@
             setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 500); }, 2500);
         }
     </script>
+    <script>
+// This intercepts the form so you don't see raw JSON
+document.querySelectorAll('.secure-form').forEach(form => {
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault(); 
+
+        const formData = new FormData(this);
+        document.getElementById('loading-guard').style.display = 'flex';
+
+        try {
+            const response = await fetch(this.action, {
+                method: 'POST',
+                body: formData,
+                headers: { 'Accept': 'application/json' }
+            });
+
+            const result = await response.json();
+            document.getElementById('loading-guard').style.display = 'none';
+
+            if (result.status === 'success') {
+                // Fill the receipt modal with the data from your Controller
+                document.getElementById('receipt-amount').innerText = result.data.amount;
+                document.getElementById('receipt-ref').innerText = result.data.reference;
+                document.getElementById('receipt-desc').innerText = result.data.description;
+                
+                if(result.data.token) {
+                    document.getElementById('receipt-token').innerText = result.data.token;
+                    document.getElementById('receipt-token-section').style.display = 'block';
+                }
+
+                closeM(this.closest('.modal').id); // Close the pay modal
+                openM('modal-receipt');           // Show the success receipt
+            } else {
+                alert(result.message);
+            }
+        } catch (error) {
+            document.getElementById('loading-guard').style.display = 'none';
+            alert("Error processing transaction");
+        }
+    });
+});
+</script>
 
     @include('components.bank-modals')
 </x-app-layout>
