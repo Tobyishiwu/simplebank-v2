@@ -1,13 +1,12 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Services;
 
+use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
-use App\Services\AirtimeService;
 use App\Models\Transaction;
-use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
+use App\Services\AirtimeService;
+use Illuminate\Support\Facades\{Auth, DB, Log, Hash};
 
 class AirtimeController extends Controller
 {
@@ -18,66 +17,90 @@ class AirtimeController extends Controller
         $this->airtimeService = $airtimeService;
     }
 
-    /**
-     * Process the Airtime Purchase.
-     */
-    public function store(Request $request)
+    public function index()
     {
+        return view('services.airtime', ['title' => 'Buy Airtime']);
+    }
+
+    public function process(Request $request)
+    {
+        // Fix: Convert provider to lowercase BEFORE validation to prevent "Invalid Provider" error
+        if ($request->has('provider')) {
+            $request->merge(['provider' => strtolower($request->provider)]);
+        }
+
+        // 1. Strict Validation (Matched to lowercase keys from Blade)
         $request->validate([
-            'network' => 'required|in:MTN,Airtel,Glo,9mobile',
-            'phone'   => 'required|digits:11',
-            'amount'  => 'required|numeric|min:100',
+            'phone'    => 'required|digits:11',
+            'amount'   => 'required|numeric|min:100',
+            'pin'      => 'required|string|size:4',
+            'provider' => 'required|in:mtn,airtel,glo,9mobile'
         ]);
 
         $user = Auth::user();
         $account = $user->account;
 
-        // Check if SB-00000002 has enough funds
-        if ($account->balance < $request->amount) {
-            return back()->with('error', 'Insufficient SimpleBank balance.');
+        // 2. PIN Presence Check
+        if (!$user->transaction_pin) {
+            return back()->withErrors(['pin' => 'Transaction PIN not set. Please visit Security settings.']);
         }
 
+        // 3. Security Check
+        if (!Hash::check($request->pin, $user->transaction_pin)) {
+            return back()->withErrors(['pin' => 'Incorrect Transaction PIN.']);
+        }
+
+        // 4. Wallet Check (PayPoint Format SB-00000002)
+        if (!$account || $account->balance < $request->amount) {
+            $accNo = $account->account_number ?? 'SB-00000002';
+            return back()->withErrors(['amount' => "Insufficient balance in your $accNo wallet."]);
+        }
+
+        // 5. Execution
         try {
-            return DB::transaction(function () use ($request, $account) {
-                // 1. Deduct locally from account balance
-                $account->decrement('balance', $request->amount);
-                $account->refresh();
+            return DB::transaction(function () use ($request, $account, $user) {
+                // Standardize network name for API (e.g., VTPass usually likes uppercase)
+                $network = strtoupper($request->provider);
+                $phone = $request->phone;
+                $amount = (int) $request->amount;
 
-                // 2. API Call to VTPass via AirtimeService
-                $result = $this->airtimeService->purchase(
-                    $request->network,
-                    $request->phone,
-                    $request->amount
-                );
+                // API Call to AirtimeService
+                $result = $this->airtimeService->purchase($network, $phone, $amount);
 
-                // Check for VTPass success code '000'
                 if (isset($result['code']) && $result['code'] === '000') {
 
-                    // 3. Save Transaction as a 'debit' for the Dashboard history
+                    // Deduct Balance
+                    $account->decrement('balance', $amount);
+                    $newBalance = $account->fresh()->balance;
+
+                    // Record Transaction
                     Transaction::create([
+                        'user_id'       => $user->id,
                         'account_id'    => $account->id,
-                        'type'          => 'debit', // Ensures red color/minus sign
+                        'type'          => 'debit',
                         'category'      => 'airtime',
-                        'amount'        => $request->amount,
-                        'balance_after' => $account->balance,
-                        'description'   => "Airtime: {$request->network} to {$request->phone}",
-                        'reference'     => $result['requestId'] ?? 'SB-AIR-'.time(),
+                        'title'         => "$network AIRTIME",
+                        'amount'        => $amount,
+                        'balance_after' => $newBalance,
+                        'description'   => "Recharge for $phone",
+                        'reference'     => $result['requestId'] ?? 'PP-' . strtoupper(uniqid()),
                         'status'        => 'completed'
                     ]);
 
-                    // Redirect to dashboard to trigger the Blue Toast notification
-                    return redirect()->route('dashboard')->with('success', 'Airtime purchased successfully!');
+                    // REDIRECT with success data for the Receipt Modal in Dashboard
+                    return redirect()->route('dashboard')->with('airtime_success', [
+                        'amount'  => $amount,
+                        'phone'   => $phone,
+                        'network' => $network,
+                        'ref'     => $result['requestId'] ?? 'PP-' . strtoupper(uniqid())
+                    ]);
                 }
 
-                // If API fails, we throw an exception to roll back the balance deduction
-                throw new \Exception($result['response_description'] ?? 'Transaction Failed at Provider');
+                throw new \Exception($result['response_description'] ?? 'The airtime provider returned an error.');
             });
-
         } catch (\Exception $e) {
-            Log::error("Airtime Error for Account {$account->account_number}: " . $e->getMessage());
-
-            // Return to form with error message in the Red Toast
-            return redirect()->route('airtime.index')->with('error', 'Transaction Failed: ' . $e->getMessage());
+            Log::error("PayPoint Airtime Error: " . $e->getMessage());
+            return back()->withErrors(['error' => $e->getMessage()])->withInput();
         }
     }
 }
